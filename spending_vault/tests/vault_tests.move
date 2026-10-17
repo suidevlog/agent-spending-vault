@@ -60,3 +60,27 @@ fun deposit_increases_balance() {
     transfer::public_transfer(cap, OWNER);
     scenario.end();
 }
+
+#[test]
+fun owner_can_withdraw() {
+    let mut scenario = test_scenario::begin(OWNER);
+
+    let cap = vault::create(scenario.ctx());
+
+    scenario.next_tx(OWNER);
+    let mut vault = scenario.take_shared<Vault>();
+
+    let payment = coin::mint_for_testing<SUI>(ONE_SUI, scenario.ctx());
+    vault.deposit(payment);
+    assert!(vault.balance_value() == ONE_SUI);
+
+    let coin = vault.withdraw(&cap, ONE_SUI/2, scenario.ctx());
+    assert!(coin.value() == ONE_SUI / 2);
+    transfer::public_transfer(coin, OWNER);
+
+    assert!(vault.balance_value() == ONE_SUI / 2);
+    test_scenario::return_shared(vault);
+    transfer::public_transfer(cap, OWNER);
+
+    scenario.end();
+}
