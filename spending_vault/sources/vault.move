@@ -15,10 +15,14 @@ public struct OwnerCap has key, store {
 
 public fun create(ctx: &mut TxContext): OwnerCap {
     let vault = Vault { id: object::new(ctx), balance: balance::zero() };
-    let cap = OwnerCap { 
+    let cap = OwnerCap {
         id: object::new(ctx),
         vault_id: object::id(&vault),
     };
     transfer::share_object(vault);
     cap
 }
+
+public fun vault_id(cap: &OwnerCap): ID { cap.vault_id }
+
+public fun balance_value(vault: &Vault): u64 { vault.balance.value() }
