@@ -2,10 +2,12 @@
 module spending_vault::vault_tests;
 
 use spending_vault::vault::{Self, Vault};
-use sui::accumulator_metadata::Owner;
-use sui::test_scenario::{Self, Scenario};
+use sui::coin;
+use sui::sui::SUI;
+use sui::test_scenario;
 
 const OWNER: address = @0xA;
+const ONE_SUI: u64 = 1_000_000_000;
 
 #[test]
 fun create_links_cap_to_its_vault() {
@@ -35,6 +37,24 @@ fun new_vault_starts_empty() {
     let vault = scenario.take_shared<Vault>();
 
     assert!(vault.balance_value() == 0);
+
+    test_scenario::return_shared(vault);
+    transfer::public_transfer(cap, OWNER);
+    scenario.end();
+}
+
+#[test]
+fun deposit_increases_balance() {
+    let mut scenario = test_scenario::begin(OWNER);
+
+    let cap = vault::create(scenario.ctx());
+
+    scenario.next_tx(OWNER);
+    let mut vault = scenario.take_shared<Vault>();
+
+    let payment = coin::mint_for_testing<SUI>(ONE_SUI, scenario.ctx());
+    vault.deposit(payment);
+    assert!(vault.balance_value() == ONE_SUI);
 
     test_scenario::return_shared(vault);
     transfer::public_transfer(cap, OWNER);
