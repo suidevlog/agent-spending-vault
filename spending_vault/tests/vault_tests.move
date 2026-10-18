@@ -145,7 +145,8 @@ fun can_withdraw_full_balance() {
     vault.deposit(payment);
 
     let coin = vault.withdraw(&cap, ONE_SUI, scenario.ctx());
-    assert!(coin.value() ==  ONE_SUI);
+    assert!(coin.value() == ONE_SUI);
+    assert!(vault.balance_value() == 0);
 
     transfer::public_transfer(coin, OWNER);
     test_scenario::return_shared(vault);
