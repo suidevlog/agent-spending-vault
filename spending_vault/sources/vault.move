@@ -87,3 +87,15 @@ public fun issue_spend_cap(
 
     transfer::transfer(spend_cap, agent);
 }
+
+public fun spend_cap_vault_id(cap: &SpendCap): ID { cap.vault_id }
+
+public fun limit_per_period(cap: &SpendCap): u64 { cap.limit_per_period }
+
+public fun period_ms(cap: &SpendCap): u64 { cap.period_ms }
+
+public fun spent_in_period(cap: &SpendCap): u64 { cap.spent_in_period }
+
+public fun period_start_ms(cap: &SpendCap): u64 { cap.period_start_ms }
+
+public fun expires_at_ms(cap: &SpendCap): u64 { cap.expires_at_ms }
