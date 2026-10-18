@@ -1,12 +1,14 @@
 module spending_vault::vault;
 
-use std::u64;
 use sui::balance::{Self, Balance};
+use sui::clock::Clock;
 use sui::coin::{Self, Coin};
 use sui::sui::SUI;
 
 const ENotOwner: u64 = 0;
 const ENotEnoughBalance: u64 = 1;
+const EInvalidPeriod: u64 = 2;
+const EAlreadyExpired: u64 = 3;
 
 public struct Vault has key {
     id: UID,
@@ -58,4 +60,30 @@ public fun withdraw(
     assert!(balance_value(vault) >= amount, ENotEnoughBalance);
 
     coin::take(&mut vault.balance, amount, ctx)
+}
+
+public fun issue_spend_cap(
+    owner_cap: &OwnerCap,
+    agent: address,
+    limit_per_period: u64,
+    period_ms: u64,
+    expires_at_ms: u64,
+    clock: &Clock,
+    ctx: &mut TxContext,
+) {
+    let now = clock.timestamp_ms();
+    assert!(period_ms > 0, EInvalidPeriod);
+    assert!(expires_at_ms > now, EAlreadyExpired);
+
+    let spend_cap = SpendCap {
+        id: object::new(ctx),
+        vault_id: owner_cap.vault_id,
+        limit_per_period,
+        period_ms,
+        spent_in_period: 0,
+        period_start_ms: now,
+        expires_at_ms,
+    };
+
+    transfer::transfer(spend_cap, agent);
 }
