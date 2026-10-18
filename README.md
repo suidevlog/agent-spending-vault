@@ -12,7 +12,7 @@ A Sui smart contract where an owner deposits SUI into a vault and give other add
 
 ## Build & test
 
-Requires: Sui CLI 1.81+
+Requires: Sui CLI 1.82+
 
     cd spending_vault
     sui move build
