@@ -9,6 +9,9 @@ const ENotOwner: u64 = 0;
 const ENotEnoughBalance: u64 = 1;
 const EInvalidPeriod: u64 = 2;
 const EAlreadyExpired: u64 = 3;
+const EWrongVault: u64 = 4;
+const ECapExpired: u64 = 5;
+const ELimitExceeded: u64 = 6;
 
 public struct Vault has key {
     id: UID,
@@ -99,3 +102,39 @@ public fun spent_in_period(cap: &SpendCap): u64 { cap.spent_in_period }
 public fun period_start_ms(cap: &SpendCap): u64 { cap.period_start_ms }
 
 public fun expires_at_ms(cap: &SpendCap): u64 { cap.expires_at_ms }
+
+public fun spend(
+    vault: &mut Vault,
+    spend_cap: &mut SpendCap,
+    amount: u64,
+    clock: &Clock,
+    ctx: &mut TxContext,
+): Coin<SUI> {
+    let now = clock.timestamp_ms();
+
+    // The cap must belong to this vault. Without this, an agent with a cap
+    // for an empty vault could spend from any other vault.
+    assert!(spend_cap.vault_id == object::id(vault), EWrongVault);
+
+    // The cap must not be expired. Same boundary as issue_spend_cap:
+    // at exactly expires_at_ms, the cap is dead.
+    assert!(now < spend_cap.expires_at_ms, ECapExpired);
+
+    // If a full period has passed, start a new one. This must happen
+    // BEFORE the limit check, or yesterday's spending blocks today's.
+    if (now >= spend_cap.period_start_ms + spend_cap.period_ms) {
+        spend_cap.spent_in_period = 0;
+        spend_cap.period_start_ms = now;
+    };
+
+    // Spending up to exactly the limit is allowed (<=)
+    assert!(spend_cap.spent_in_period + amount <= spend_cap.limit_per_period, ELimitExceeded);
+
+    // The vault must hold enough. Our own error code tells the agent
+    // exactly why it failed, instead of a generic framework error.
+    assert!(vault.balance_value() >= amount, ENotEnoughBalance);
+
+    // All checks passed: record the spend, then release the coin.
+    spend_cap.spent_in_period = spend_cap.spent_in_period + amount;
+    coin::take(&mut vault.balance, amount, ctx)
+}
