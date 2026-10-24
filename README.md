@@ -5,7 +5,7 @@ A Sui smart contract where an owner deposits SUI into a vault and give other add
 ## Status
 
 - [x] V0 - Project setup
-- [ ] V1 - Vault, owner withdraw, one spend capability with limit and expiry
+- [x] V1 - Vault, owner withdraw, one spend capability with limit and expiry
 - [ ] V2 - Multiple capabilites, revocation, recipient allowlist, events, any coin type
 - [ ] V3 - TypeScript client and autonomous agent script, sponsored gas
 - [ ] v4 - Web frontend with zkLogin
