@@ -3,7 +3,6 @@ module spending_vault::vault;
 use sui::balance::{Self, Balance};
 use sui::clock::Clock;
 use sui::coin::{Self, Coin};
-use sui::sui::SUI;
 
 const ENotOwner: u64 = 0;
 const ENotEnoughBalance: u64 = 1;
@@ -13,9 +12,9 @@ const EWrongVault: u64 = 4;
 const ECapExpired: u64 = 5;
 const ELimitExceeded: u64 = 6;
 
-public struct Vault has key {
+public struct Vault<phantom T> has key {
     id: UID,
-    balance: Balance<SUI>,
+    balance: Balance<T>,
 }
 
 public struct OwnerCap has key, store {
@@ -33,8 +32,8 @@ public struct SpendCap has key {
     expires_at_ms: u64,
 }
 
-public fun create(ctx: &mut TxContext): OwnerCap {
-    let vault = Vault { id: object::new(ctx), balance: balance::zero() };
+public fun create<T>(ctx: &mut TxContext): OwnerCap {
+    let vault = Vault { id: object::new(ctx), balance: balance::zero<T>() };
     let cap = OwnerCap {
         id: object::new(ctx),
         vault_id: object::id(&vault),
@@ -45,19 +44,19 @@ public fun create(ctx: &mut TxContext): OwnerCap {
 
 public fun vault_id(cap: &OwnerCap): ID { cap.vault_id }
 
-public fun balance_value(vault: &Vault): u64 { vault.balance.value() }
+public fun balance_value<T>(vault: &Vault<T>): u64 { vault.balance.value() }
 
-public fun deposit(vault: &mut Vault, payment: Coin<SUI>) {
+public fun deposit<T>(vault: &mut Vault<T>, payment: Coin<T>) {
     vault.balance.join(payment.into_balance());
 }
 
-public fun withdraw(
-    vault: &mut Vault,
+public fun withdraw<T>(
+    vault: &mut Vault<T>,
     cap: &OwnerCap,
     amount: u64,
     ctx: &mut TxContext,
-): Coin<SUI> {
-    //Only owner can withdraw otherwise abort
+): Coin<T> {
+    // Only owner can withdraw otherwise abort
     assert!(cap.vault_id == object::id(vault), ENotOwner);
     // Balance has to be equal or more than withdrawal amount
     assert!(balance_value(vault) >= amount, ENotEnoughBalance);
@@ -103,13 +102,13 @@ public fun period_start_ms(cap: &SpendCap): u64 { cap.period_start_ms }
 
 public fun expires_at_ms(cap: &SpendCap): u64 { cap.expires_at_ms }
 
-public fun spend(
-    vault: &mut Vault,
+public fun spend<T>(
+    vault: &mut Vault<T>,
     spend_cap: &mut SpendCap,
     amount: u64,
     clock: &Clock,
     ctx: &mut TxContext,
-): Coin<SUI> {
+): Coin<T> {
     let now = clock.timestamp_ms();
 
     // The cap must belong to this vault. Without this, an agent with a cap
@@ -128,7 +127,7 @@ public fun spend(
     };
 
     // Spending up to exactly the limit is allowed (<=)
-    assert!(spend_cap.spent_in_period + amount <= spend_cap.limit_per_period, ELimitExceeded);
+    assert!(amount <= spend_cap.limit_per_period - spend_cap.spent_in_period, ELimitExceeded);
 
     // The vault must hold enough. Our own error code tells the agent
     // exactly why it failed, instead of a generic framework error.
