@@ -3,6 +3,7 @@ module spending_vault::vault;
 use sui::balance::{Self, Balance};
 use sui::clock::Clock;
 use sui::coin::{Self, Coin};
+use sui::dynamic_field as df;
 
 const ENotOwner: u64 = 0;
 const ENotEnoughBalance: u64 = 1;
@@ -25,12 +26,19 @@ public struct OwnerCap has key, store {
 public struct SpendCap has key {
     id: UID,
     vault_id: ID,
+}
+
+// One cap's rules and running totals, stored on the vault.
+public struct CapRules has drop, store {
     limit_per_period: u64,
     period_ms: u64,
     spent_in_period: u64,
     period_start_ms: u64,
     expires_at_ms: u64,
 }
+
+// Dynamic-field key: the SpendCap's ID wrapped in its own type.
+public struct CapKey(ID) has copy, drop, store;
 
 public fun create<T>(ctx: &mut TxContext): OwnerCap {
     let vault = Vault { id: object::new(ctx), balance: balance::zero<T>() };
@@ -64,7 +72,8 @@ public fun withdraw<T>(
     coin::take(&mut vault.balance, amount, ctx)
 }
 
-public fun issue_spend_cap(
+public fun issue_spend_cap<T>(
+    vault: &mut Vault<T>,
     owner_cap: &OwnerCap,
     agent: address,
     limit_per_period: u64,
@@ -73,67 +82,87 @@ public fun issue_spend_cap(
     clock: &Clock,
     ctx: &mut TxContext,
 ) {
+    assert!(owner_cap.vault_id == object::id(vault), ENotOwner);
     let now = clock.timestamp_ms();
     assert!(period_ms > 0, EInvalidPeriod);
     assert!(expires_at_ms > now, EAlreadyExpired);
 
     let spend_cap = SpendCap {
         id: object::new(ctx),
-        vault_id: owner_cap.vault_id,
-        limit_per_period,
-        period_ms,
-        spent_in_period: 0,
-        period_start_ms: now,
-        expires_at_ms,
+        vault_id: object::id(vault),
     };
+    df::add(
+        &mut vault.id,
+        CapKey(object::id(&spend_cap)),
+        CapRules {
+            limit_per_period,
+            period_ms,
+            spent_in_period: 0,
+            period_start_ms: now,
+            expires_at_ms,
+        },
+    );
 
     transfer::transfer(spend_cap, agent);
 }
 
+fun rules<T>(vault: &Vault<T>, cap_id: ID): &CapRules {
+    df::borrow(&vault.id, CapKey(cap_id))
+}
+
 public fun spend_cap_vault_id(cap: &SpendCap): ID { cap.vault_id }
 
-public fun limit_per_period(cap: &SpendCap): u64 { cap.limit_per_period }
+public fun limit_per_period<T>(vault: &Vault<T>, cap_id: ID): u64 {
+    rules(vault, cap_id).limit_per_period
+}
 
-public fun period_ms(cap: &SpendCap): u64 { cap.period_ms }
+public fun period_ms<T>(vault: &Vault<T>, cap_id: ID): u64 { rules(vault, cap_id).period_ms }
 
-public fun spent_in_period(cap: &SpendCap): u64 { cap.spent_in_period }
+public fun spent_in_period<T>(vault: &Vault<T>, cap_id: ID): u64 {
+    rules(vault, cap_id).spent_in_period
+}
 
-public fun period_start_ms(cap: &SpendCap): u64 { cap.period_start_ms }
+public fun period_start_ms<T>(vault: &Vault<T>, cap_id: ID): u64 {
+    rules(vault, cap_id).period_start_ms
+}
 
-public fun expires_at_ms(cap: &SpendCap): u64 { cap.expires_at_ms }
+public fun expires_at_ms<T>(vault: &Vault<T>, cap_id: ID): u64 {
+    rules(vault, cap_id).expires_at_ms
+}
 
 public fun spend<T>(
     vault: &mut Vault<T>,
-    spend_cap: &mut SpendCap,
+    spend_cap: &SpendCap,
     amount: u64,
     clock: &Clock,
     ctx: &mut TxContext,
 ): Coin<T> {
     let now = clock.timestamp_ms();
 
-    // The cap must belong to this vault. Without this, an agent with a cap
-    // for an empty vault could spend from any other vault.
+    // The cap must belong to this vault.
     assert!(spend_cap.vault_id == object::id(vault), EWrongVault);
 
-    // The cap must not be expired. Same boundary as issue_spend_cap:
+    let rules: &mut CapRules = df::borrow_mut(&mut vault.id, CapKey(object::id(spend_cap)));
+
     // at exactly expires_at_ms, the cap is dead.
-    assert!(now < spend_cap.expires_at_ms, ECapExpired);
+    assert!(now < rules.expires_at_ms, ECapExpired);
 
     // If a full period has passed, start a new one. This must happen
     // BEFORE the limit check, or yesterday's spending blocks today's.
-    if (now >= spend_cap.period_start_ms + spend_cap.period_ms) {
-        spend_cap.spent_in_period = 0;
-        spend_cap.period_start_ms = now;
+    if (now >= rules.period_start_ms + rules.period_ms) {
+        rules.spent_in_period = 0;
+        rules.period_start_ms = now;
     };
 
     // Spending up to exactly the limit is allowed (<=)
-    assert!(amount <= spend_cap.limit_per_period - spend_cap.spent_in_period, ELimitExceeded);
+    assert!(amount <= rules.limit_per_period - rules.spent_in_period, ELimitExceeded);
 
-    // The vault must hold enough. Our own error code tells the agent
-    // exactly why it failed, instead of a generic framework error.
+    // Record the spend. If the balance check below aborts, the whole
+    // transaction reverts, so this write never persists on failure.
+    rules.spent_in_period = rules.spent_in_period + amount;
+
+    // 'rules' is no longer used, so the mutable borrow of vault.id has ended
+    // and we may borrow the whole vault again.
     assert!(vault.balance_value() >= amount, ENotEnoughBalance);
-
-    // All checks passed: record the spend, then release the coin.
-    spend_cap.spent_in_period = spend_cap.spent_in_period + amount;
     coin::take(&mut vault.balance, amount, ctx)
 }

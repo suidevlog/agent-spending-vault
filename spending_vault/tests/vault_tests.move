@@ -10,6 +10,7 @@ use sui::test_scenario::{Self, Scenario};
 const OWNER: address = @0xA;
 const ONE_SUI: u64 = 1_000_000_000;
 const AGENT: address = @0xB;
+const AGENT_2: address = @0xc;
 const DAY_MS: u64 = 86_400_000;
 const START_MS: u64 = 1_000_000;
 
@@ -23,7 +24,12 @@ public struct TEST_USD has drop {}
 // Ends in a fresh transaction as AGENT, ready to spend.
 fun setup(scenario: &mut Scenario, clock: &Clock): OwnerCap {
     let owner_cap = vault::create<SUI>(scenario.ctx());
-    vault::issue_spend_cap(
+
+    // The vault is shared at the end of this tx; take it in the next one.
+    scenario.next_tx(OWNER);
+    let mut vault = scenario.take_shared<Vault<SUI>>();
+    vault.deposit(coin::mint_for_testing(10 * ONE_SUI, scenario.ctx()));
+    vault.issue_spend_cap(
         &owner_cap,
         AGENT,
         ONE_SUI,
@@ -32,9 +38,7 @@ fun setup(scenario: &mut Scenario, clock: &Clock): OwnerCap {
         clock,
         scenario.ctx(),
     );
-    scenario.next_tx(OWNER);
-    let mut vault = scenario.take_shared<Vault<SUI>>();
-    vault.deposit(coin::mint_for_testing(10 * ONE_SUI, scenario.ctx()));
+
     test_scenario::return_shared(vault);
 
     scenario.next_tx(AGENT);
@@ -205,13 +209,13 @@ fun can_withdraw_full_balance() {
 #[test]
 fun issue_sends_cap_to_agent_with_rules() {
     let mut scenario = test_scenario::begin(OWNER);
-
     let owner_cap = vault::create<SUI>(scenario.ctx());
-
     let mut test_clock = clock::create_for_testing(scenario.ctx());
     test_clock.set_for_testing(START_MS);
 
-    vault::issue_spend_cap(
+    scenario.next_tx(OWNER);
+    let mut vault = scenario.take_shared<Vault<SUI>>();
+    vault.issue_spend_cap(
         &owner_cap,
         AGENT,
         ONE_SUI,
@@ -221,15 +225,21 @@ fun issue_sends_cap_to_agent_with_rules() {
         scenario.ctx(),
     );
 
-    scenario.next_tx(AGENT);
-    let spend_cap = scenario.take_from_sender<SpendCap>();
-    assert!(owner_cap.vault_id() == spend_cap.spend_cap_vault_id());
-    assert!(spend_cap.limit_per_period() == ONE_SUI);
-    assert!(spend_cap.period_ms() == DAY_MS);
-    assert!(spend_cap.expires_at_ms() == START_MS + 7 * DAY_MS);
-    assert!(spend_cap.spent_in_period() == 0);
-    assert!(spend_cap.period_start_ms() == START_MS);
+    test_scenario::return_shared(vault);
 
+    scenario.next_tx(AGENT);
+    let vault = scenario.take_shared<Vault<SUI>>();
+    let spend_cap = scenario.take_from_sender<SpendCap>();
+    let cap_id = object::id(&spend_cap);
+
+    assert!(owner_cap.vault_id() == spend_cap.spend_cap_vault_id());
+    assert!(vault.limit_per_period(cap_id) == ONE_SUI);
+    assert!(vault.period_ms(cap_id) == DAY_MS);
+    assert!(vault.expires_at_ms(cap_id) == START_MS + 7 * DAY_MS);
+    assert!(vault.spent_in_period(cap_id) == 0);
+    assert!(vault.period_start_ms(cap_id) == START_MS);
+
+    test_scenario::return_shared(vault);
     scenario.return_to_sender(spend_cap);
     transfer::public_transfer(owner_cap, OWNER);
     test_clock.destroy_for_testing();
@@ -247,11 +257,11 @@ fun agent_can_spend_within_limit() {
     let owner_cap = setup(&mut scenario, &test_clock);
 
     let mut vault = scenario.take_shared<Vault<SUI>>();
-    let mut spend_cap = scenario.take_from_sender<SpendCap>();
+    let spend_cap = scenario.take_from_sender<SpendCap>();
 
-    let coin = vault.spend(&mut spend_cap, ONE_SUI / 2, &test_clock, scenario.ctx());
+    let coin = vault.spend(&spend_cap, ONE_SUI / 2, &test_clock, scenario.ctx());
     assert!(coin.value() == ONE_SUI / 2);
-    assert!(spend_cap.spent_in_period() == ONE_SUI / 2);
+    assert!(vault.spent_in_period(object::id(&spend_cap)) == ONE_SUI / 2);
     assert!(vault.balance_value() == 10 * ONE_SUI - ONE_SUI / 2);
 
     transfer::public_transfer(coin, AGENT);
@@ -267,9 +277,9 @@ fun cannot_spend_over_limit() {
     let owner_cap = setup(&mut scenario, &test_clock);
 
     let mut vault = scenario.take_shared<Vault<SUI>>();
-    let mut spend_cap = scenario.take_from_sender<SpendCap>();
+    let spend_cap = scenario.take_from_sender<SpendCap>();
 
-    let coin = vault.spend(&mut spend_cap, ONE_SUI + 1, &test_clock, scenario.ctx());
+    let coin = vault.spend(&spend_cap, ONE_SUI + 1, &test_clock, scenario.ctx());
 
     transfer::public_transfer(coin, AGENT);
     cleanup(scenario, vault, spend_cap, owner_cap, test_clock);
@@ -286,13 +296,13 @@ fun limit_does_not_reset_before_period_ends() {
     let owner_cap = setup(&mut scenario, &test_clock);
 
     let mut vault = scenario.take_shared<Vault<SUI>>();
-    let mut spend_cap = scenario.take_from_sender<SpendCap>();
+    let spend_cap = scenario.take_from_sender<SpendCap>();
 
-    let first = vault.spend(&mut spend_cap, ONE_SUI, &test_clock, scenario.ctx());
+    let first = vault.spend(&spend_cap, ONE_SUI, &test_clock, scenario.ctx());
     transfer::public_transfer(first, AGENT);
 
     test_clock.set_for_testing(START_MS + DAY_MS - 1);
-    let second = vault.spend(&mut spend_cap, 1, &test_clock, scenario.ctx());
+    let second = vault.spend(&spend_cap, 1, &test_clock, scenario.ctx());
 
     transfer::public_transfer(second, AGENT);
     cleanup(scenario, vault, spend_cap, owner_cap, test_clock);
@@ -308,16 +318,16 @@ fun limit_resets_after_period() {
     let owner_cap = setup(&mut scenario, &test_clock);
 
     let mut vault = scenario.take_shared<Vault<SUI>>();
-    let mut spend_cap = scenario.take_from_sender<SpendCap>();
+    let spend_cap = scenario.take_from_sender<SpendCap>();
 
-    let first = vault.spend(&mut spend_cap, ONE_SUI, &test_clock, scenario.ctx());
+    let first = vault.spend(&spend_cap, ONE_SUI, &test_clock, scenario.ctx());
     transfer::public_transfer(first, AGENT);
 
     test_clock.set_for_testing(START_MS + DAY_MS);
-    let second = vault.spend(&mut spend_cap, ONE_SUI, &test_clock, scenario.ctx());
+    let second = vault.spend(&spend_cap, ONE_SUI, &test_clock, scenario.ctx());
     assert!(second.value() == ONE_SUI);
-    assert!(spend_cap.spent_in_period() == ONE_SUI);
-    assert!(spend_cap.period_start_ms() == START_MS + DAY_MS);
+    assert!(vault.spent_in_period(object::id(&spend_cap)) == ONE_SUI);
+    assert!(vault.period_start_ms(object::id(&spend_cap)) == START_MS + DAY_MS);
 
     transfer::public_transfer(second, AGENT);
     cleanup(scenario, vault, spend_cap, owner_cap, test_clock);
@@ -332,10 +342,10 @@ fun cannot_spend_at_expiry() {
     let owner_cap = setup(&mut scenario, &test_clock);
 
     let mut vault = scenario.take_shared<Vault<SUI>>();
-    let mut spend_cap = scenario.take_from_sender<SpendCap>();
+    let spend_cap = scenario.take_from_sender<SpendCap>();
 
     test_clock.set_for_testing(START_MS + 7 * DAY_MS);
-    let coin = vault.spend(&mut spend_cap, 1, &test_clock, scenario.ctx());
+    let coin = vault.spend(&spend_cap, 1, &test_clock, scenario.ctx());
 
     transfer::public_transfer(coin, AGENT);
     cleanup(scenario, vault, spend_cap, owner_cap, test_clock)
@@ -355,9 +365,9 @@ fun cap_cannot_spend_from_other_vault() {
 
     let mut other_vault = scenario.take_shared_by_id<Vault<SUI>>(other_owner_cap.vault_id());
     other_vault.deposit(coin::mint_for_testing<SUI>(ONE_SUI, scenario.ctx()));
-    let mut spend_cap = scenario.take_from_sender<SpendCap>();
+    let spend_cap = scenario.take_from_sender<SpendCap>();
 
-    let coin = other_vault.spend(&mut spend_cap, 1, &test_clock, scenario.ctx());
+    let coin = other_vault.spend(&spend_cap, 1, &test_clock, scenario.ctx());
 
     transfer::public_transfer(coin, AGENT);
     transfer::public_transfer(other_owner_cap, OWNER);
@@ -375,14 +385,14 @@ fun huge_amount_fails_with_limit_error() {
     let owner_cap = setup(&mut scenario, &test_clock);
 
     let mut vault = scenario.take_shared<Vault<SUI>>();
-    let mut spend_cap = scenario.take_from_sender<SpendCap>();
+    let spend_cap = scenario.take_from_sender<SpendCap>();
 
-    let first = vault.spend(&mut spend_cap, 1, &test_clock, scenario.ctx());
+    let first = vault.spend(&spend_cap, 1, &test_clock, scenario.ctx());
     transfer::public_transfer(first, AGENT);
 
     //u64::MAX
     let second = vault.spend(
-        &mut spend_cap,
+        &spend_cap,
         18_446_744_073_709_551_615,
         &test_clock,
         scenario.ctx(),
@@ -402,7 +412,11 @@ fun vault_works_with_non_sui_coin() {
     test_clock.set_for_testing(START_MS);
 
     let owner_cap = vault::create<TEST_USD>(scenario.ctx());
-    vault::issue_spend_cap(
+
+    scenario.next_tx(OWNER);
+    let mut vault = scenario.take_shared<Vault<TEST_USD>>();
+    vault.deposit(coin::mint_for_testing<TEST_USD>(1000, scenario.ctx()));
+    vault.issue_spend_cap(
         &owner_cap,
         AGENT,
         100,
@@ -411,17 +425,13 @@ fun vault_works_with_non_sui_coin() {
         &test_clock,
         scenario.ctx(),
     );
-
-    scenario.next_tx(OWNER);
-    let mut vault = scenario.take_shared<Vault<TEST_USD>>();
-    vault.deposit(coin::mint_for_testing<TEST_USD>(1000, scenario.ctx()));
     test_scenario::return_shared(vault);
 
     scenario.next_tx(AGENT);
     let mut vault = scenario.take_shared<Vault<TEST_USD>>();
-    let mut spend_cap = scenario.take_from_sender<SpendCap>();
+    let spend_cap = scenario.take_from_sender<SpendCap>();
 
-    let coin = vault.spend(&mut spend_cap, 100, &test_clock, scenario.ctx());
+    let coin = vault.spend(&spend_cap, 100, &test_clock, scenario.ctx());
     assert!(coin.value() == 100);
     assert!(vault.balance_value() == 900);
 
@@ -431,4 +441,79 @@ fun vault_works_with_non_sui_coin() {
     transfer::public_transfer(owner_cap, OWNER);
     test_clock.destroy_for_testing();
     scenario.end();
+}
+
+// Security: an OwnerCap for vault B must not plant a spend cap on vault A.
+#[test, expected_failure(abort_code = vault::ENotOwner)]
+fun other_owner_cap_cannot_issue_on_vault() {
+    let mut scenario = test_scenario::begin(OWNER);
+    let mut test_clock = clock::create_for_testing(scenario.ctx());
+    test_clock.set_for_testing(START_MS);
+
+    let cap_a = vault::create<SUI>(scenario.ctx());
+    let cap_b = vault::create<SUI>(scenario.ctx());
+
+    scenario.next_tx(OWNER);
+    let mut vault_a = scenario.take_shared_by_id<Vault<SUI>>(cap_a.vault_id());
+    vault_a.issue_spend_cap(
+        &cap_b,
+        AGENT,
+        ONE_SUI,
+        DAY_MS,
+        START_MS + 7 *DAY_MS,
+        &test_clock,
+        scenario.ctx(),
+    );
+
+    test_scenario::return_shared(vault_a);
+    transfer::public_transfer(cap_a, OWNER);
+    transfer::public_transfer(cap_b, OWNER);
+    test_clock.destroy_for_testing();
+    scenario.end();
+}
+
+//Multiple caps: two caps on one vault keep separate totals.
+#[test]
+fun two_caps_track_spending_separately() {
+    let mut scenario = test_scenario::begin(OWNER);
+    let mut test_clock = clock::create_for_testing(scenario.ctx());
+    test_clock.set_for_testing(START_MS);
+    let owner_cap = setup(&mut scenario, &test_clock);
+
+    //setup ended as AGENT; issuing is the owner's job.
+    scenario.next_tx(OWNER);
+    let mut vault = scenario.take_shared<Vault<SUI>>();
+    vault.issue_spend_cap(
+        &owner_cap,
+        AGENT_2,
+        ONE_SUI,
+        DAY_MS,
+        START_MS + 7 * DAY_MS,
+        &test_clock,
+        scenario.ctx(),
+    );
+    test_scenario::return_shared(vault);
+
+    // AGENT spends its full limit.
+    scenario.next_tx(AGENT);
+    let mut vault = scenario.take_shared<Vault<SUI>>();
+    let cap_1 = scenario.take_from_sender<SpendCap>();
+    let cap_1_id = object::id(&cap_1);
+    let c1 = vault.spend(&cap_1, ONE_SUI, &test_clock, scenario.ctx());
+    transfer::public_transfer(c1, AGENT);
+    test_scenario::return_shared(vault);
+    scenario.return_to_sender(cap_1);
+
+    // AGENT_2 can still spend its full limit in the same period.
+    scenario.next_tx(AGENT_2);
+    let mut vault = scenario.take_shared<Vault<SUI>>();
+    let cap_2 = scenario.take_from_sender<SpendCap>();
+    let c2 = vault.spend(&cap_2, ONE_SUI, &test_clock, scenario.ctx());
+    assert!(c2.value() == ONE_SUI);
+    assert!(vault.spent_in_period(cap_1_id) == ONE_SUI);
+    assert!(vault.spent_in_period(object::id(&cap_2)) == ONE_SUI);
+    assert!(vault.balance_value() == 8 * ONE_SUI);
+
+    transfer::public_transfer(c2, AGENT_2);
+    cleanup(scenario, vault, cap_2, owner_cap, test_clock);
 }
