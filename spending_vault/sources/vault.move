@@ -12,6 +12,7 @@ const EAlreadyExpired: u64 = 3;
 const EWrongVault: u64 = 4;
 const ECapExpired: u64 = 5;
 const ELimitExceeded: u64 = 6;
+const ECapRevoked: u64 = 7;
 
 public struct Vault<phantom T> has key {
     id: UID,
@@ -106,6 +107,18 @@ public fun issue_spend_cap<T>(
     transfer::transfer(spend_cap, agent);
 }
 
+// Owner kills a cap immediately. The agent still holds its SpendCap
+// object, but the rules it points to are gone.
+public fun revoke_spend_cap<T>(vault: &mut Vault<T>, owner_cap: &OwnerCap, cap_id: ID) {
+    assert!(owner_cap.vault_id == object::id(vault), ENotOwner);
+    assert!(df::exists(&vault.id, CapKey(cap_id)), ECapRevoked);
+    let _rules: CapRules = df::remove(&mut vault.id, CapKey(cap_id));
+}
+
+public fun is_active<T>(vault: &Vault<T>, cap_id: ID): bool {
+    df::exists(&vault.id, CapKey(cap_id))
+}
+
 fun rules<T>(vault: &Vault<T>, cap_id: ID): &CapRules {
     df::borrow(&vault.id, CapKey(cap_id))
 }
@@ -141,6 +154,9 @@ public fun spend<T>(
 
     // The cap must belong to this vault.
     assert!(spend_cap.vault_id == object::id(vault), EWrongVault);
+
+    // A revoked cap has no rules on the vault.
+    assert!(df::exists(&vault.id, CapKey(object::id(spend_cap))), ECapRevoked);
 
     let rules: &mut CapRules = df::borrow_mut(&mut vault.id, CapKey(object::id(spend_cap)));
 

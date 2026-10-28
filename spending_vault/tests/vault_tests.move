@@ -60,6 +60,19 @@ fun cleanup(
     scenario.end();
 }
 
+// The ID of the most recent SpendCap sent to 'agent'.
+fun cap_id_of(agent: address): ID {
+    test_scenario::most_recent_id_for_address<SpendCap>(agent).destroy_some()
+}
+
+// Starts a fresh tx as OWNER and revokes 'cap_id' on the SUI vault.
+fun revoke_as_owner(scenario: &mut Scenario, owner_cap: &OwnerCap, cap_id: ID) {
+    scenario.next_tx(OWNER);
+    let mut vault = scenario.take_shared<Vault<SUI>>();
+    vault.revoke_spend_cap(owner_cap, cap_id);
+    test_scenario::return_shared(vault);
+}
+
 #[test]
 fun create_links_cap_to_its_vault() {
     let mut scenario = test_scenario::begin(OWNER);
@@ -515,5 +528,103 @@ fun two_caps_track_spending_separately() {
     assert!(vault.balance_value() == 8 * ONE_SUI);
 
     transfer::public_transfer(c2, AGENT_2);
+    cleanup(scenario, vault, cap_2, owner_cap, test_clock);
+}
+
+// Revocation: after owner revokes, the agent's next spend aborts,
+// even though the agent still holds the SpendCap object.
+#[test, expected_failure(abort_code = vault::ECapRevoked)]
+fun revoked_cap_cannot_spend() {
+    let mut scenario = test_scenario::begin(OWNER);
+    let mut test_clock = clock::create_for_testing(scenario.ctx());
+    test_clock.set_for_testing(START_MS);
+    let owner_cap = setup(&mut scenario, &test_clock);
+
+    revoke_as_owner(&mut scenario, &owner_cap, cap_id_of(AGENT));
+
+    scenario.next_tx(AGENT);
+    let mut vault = scenario.take_shared<Vault<SUI>>();
+    let spend_cap = scenario.take_from_sender<SpendCap>();
+    let coin = vault.spend(&spend_cap, 1, &test_clock, scenario.ctx());
+
+    transfer::public_transfer(coin, AGENT);
+    cleanup(scenario, vault, spend_cap, owner_cap, test_clock);
+}
+
+// Revoking an already-revoked cap aborts with our code, not a framework one.
+#[test, expected_failure(abort_code = vault::ECapRevoked)]
+fun cannot_revoke_twice() {
+    let mut scenario = test_scenario::begin(OWNER);
+    let mut test_clock = clock::create_for_testing(scenario.ctx());
+    test_clock.set_for_testing(START_MS);
+    let owner_cap = setup(&mut scenario, &test_clock);
+
+    let cap_id = cap_id_of(AGENT);
+    revoke_as_owner(&mut scenario, &owner_cap, cap_id);
+    revoke_as_owner(&mut scenario, &owner_cap, cap_id);
+
+    scenario.next_tx(AGENT);
+    let vault = scenario.take_shared<Vault<SUI>>();
+    let spend_cap = scenario.take_from_sender<SpendCap>();
+    cleanup(scenario, vault, spend_cap, owner_cap, test_clock);
+}
+
+// Security: vault B's OwnerCap must not revoke vault A's caps.
+#[test, expected_failure(abort_code = vault::ENotOwner)]
+fun other_owner_cap_cannot_revoke() {
+    let mut scenario = test_scenario::begin(OWNER);
+    let mut test_clock = clock::create_for_testing(scenario.ctx());
+    test_clock.set_for_testing(START_MS);
+    let owner_cap = setup(&mut scenario, &test_clock);
+
+    scenario.next_tx(OWNER);
+    let mut cap_b = vault::create<SUI>(scenario.ctx());
+
+    // Two SUI vaults exist now, so take A by ID
+    scenario.next_tx(OWNER);
+    let mut vault_a = scenario.take_shared_by_id<Vault<SUI>>(owner_cap.vault_id());
+    vault_a.revoke_spend_cap(&cap_b, cap_id_of(AGENT));
+
+    test_scenario::return_shared(vault_a);
+    transfer::public_transfer(cap_b, OWNER);
+    transfer::public_transfer(owner_cap, OWNER);
+    test_clock.destroy_for_testing();
+    scenario.end();
+}
+
+// Revoke one cap removes only its own rules; other caps keep working.
+#[test]
+fun revoking_one_cap_leaves_others_active() {
+    let mut scenario = test_scenario::begin(OWNER);
+    let mut test_clock = clock::create_for_testing(scenario.ctx());
+    test_clock.set_for_testing(START_MS);
+    let owner_cap = setup(&mut scenario, &test_clock);
+
+    scenario.next_tx(OWNER);
+    let mut vault = scenario.take_shared<Vault<SUI>>();
+    vault.issue_spend_cap(
+        &owner_cap,
+        AGENT_2,
+        ONE_SUI,
+        DAY_MS,
+        START_MS + 7 * DAY_MS,
+        &test_clock,
+        scenario.ctx(),
+    );
+    test_scenario::return_shared(vault);
+
+    let cap_1_id = cap_id_of(AGENT);
+    revoke_as_owner(&mut scenario, &owner_cap, cap_1_id);
+
+    scenario.next_tx(AGENT_2);
+    let mut vault = scenario.take_shared<Vault<SUI>>();
+    let cap_2 = scenario.take_from_sender<SpendCap>();
+    assert!(!vault.is_active(cap_1_id));
+    assert!(vault.is_active(object::id(&cap_2)));
+
+    let coin = vault.spend(&cap_2, ONE_SUI, &test_clock, scenario.ctx());
+    assert!(coin.value() == ONE_SUI);
+    
+    transfer::public_transfer(coin, AGENT_2);
     cleanup(scenario, vault, cap_2, owner_cap, test_clock);
 }
