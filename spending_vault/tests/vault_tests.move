@@ -3,7 +3,7 @@ module spending_vault::vault_tests;
 
 use spending_vault::vault::{Self, Vault, OwnerCap, SpendCap};
 use sui::clock::{Self, Clock};
-use sui::coin;
+use sui::coin::{Self, Coin};
 use sui::sui::SUI;
 use sui::test_scenario::{Self, Scenario};
 
@@ -11,6 +11,8 @@ const OWNER: address = @0xA;
 const ONE_SUI: u64 = 1_000_000_000;
 const AGENT: address = @0xB;
 const AGENT_2: address = @0xc;
+const RECIPIENT: address = @0xD;
+const OTHER: address = @0xE;
 const DAY_MS: u64 = 86_400_000;
 const START_MS: u64 = 1_000_000;
 
@@ -70,6 +72,19 @@ fun revoke_as_owner(scenario: &mut Scenario, owner_cap: &OwnerCap, cap_id: ID) {
     scenario.next_tx(OWNER);
     let mut vault = scenario.take_shared<Vault<SUI>>();
     vault.revoke_spend_cap(owner_cap, cap_id);
+    test_scenario::return_shared(vault);
+}
+
+// Starts a fresh tx as OWNER and restricts `cap_id` to `recipients`.
+fun set_allowlist_as_owner(
+    scenario: &mut Scenario,
+    owner_cap: &OwnerCap,
+    cap_id: ID,
+    recipients: vector<address>,
+) {
+    scenario.next_tx(OWNER);
+    let mut vault = scenario.take_shared<Vault<SUI>>();
+    vault.set_allowlist(owner_cap, cap_id, recipients);
     test_scenario::return_shared(vault);
 }
 
@@ -627,4 +642,135 @@ fun revoking_one_cap_leaves_others_active() {
     
     transfer::public_transfer(coin, AGENT_2);
     cleanup(scenario, vault, cap_2, owner_cap, test_clock);
+}
+
+// Allowlist, happy path: a restricted cap pays a listed recipient, and
+// the coin lands at the recipient, not at the agent.
+#[test]
+fun restricted_cap_pays_allowed_recipient() {
+    let mut scenario = test_scenario::begin(OWNER);
+    let mut test_clock = clock::create_for_testing(scenario.ctx());
+    test_clock.set_for_testing(START_MS);
+    let owner_cap = setup(&mut scenario, &test_clock);
+    set_allowlist_as_owner(&mut scenario, &owner_cap, cap_id_of(AGENT), vector[RECIPIENT]);
+
+    scenario.next_tx(AGENT);
+    let mut vault = scenario.take_shared<Vault<SUI>>();
+    let spend_cap = scenario.take_from_sender<SpendCap>();
+    let cap_id = object::id(&spend_cap);
+    assert!(vault.is_recipient_allowed(cap_id, RECIPIENT));
+    assert!(!vault.is_recipient_allowed(cap_id, OTHER));
+
+    vault.spend_to(&spend_cap, ONE_SUI / 2, RECIPIENT, &test_clock, scenario.ctx());
+    assert!(vault.spent_in_period(cap_id) == ONE_SUI / 2);
+    test_scenario::return_shared(vault);
+    scenario.return_to_sender(spend_cap);
+
+    scenario.next_tx(RECIPIENT);
+    let paid = scenario.take_from_sender<Coin<SUI>>();
+    assert!(paid.value() == ONE_SUI / 2);
+    scenario.return_to_sender(paid);
+
+    transfer::public_transfer(owner_cap, OWNER);
+    test_clock.destroy_for_testing();
+    scenario.end();
+}
+
+// Allowlist: an unlisted recipient is refused.
+#[test, expected_failure(abort_code = vault::ERecipientNotAllowed)]
+fun restricted_cap_rejects_other_recipient() {
+    let mut scenario = test_scenario::begin(OWNER);
+    let mut test_clock = clock::create_for_testing(scenario.ctx());
+    test_clock.set_for_testing(START_MS);
+    let owner_cap = setup(&mut scenario, &test_clock);
+    set_allowlist_as_owner(&mut scenario, &owner_cap, cap_id_of(AGENT), vector[RECIPIENT]);
+
+    scenario.next_tx(AGENT);
+    let mut vault = scenario.take_shared<Vault<SUI>>();
+    let spend_cap = scenario.take_from_sender<SpendCap>();
+    vault.spend_to(&spend_cap, 1, OTHER, &test_clock, scenario.ctx());
+
+    cleanup(scenario, vault, spend_cap, owner_cap, test_clock);
+}
+
+// Allowlist: a restricted cap cannot use `spend`, because the returned
+// coin could be sent anywhere.
+#[test, expected_failure(abort_code = vault::ERestrictedCap)]
+fun restricted_cap_cannot_use_spend() {
+    let mut scenario = test_scenario::begin(OWNER);
+    let mut test_clock = clock::create_for_testing(scenario.ctx());
+    test_clock.set_for_testing(START_MS);
+    let owner_cap = setup(&mut scenario, &test_clock);
+    set_allowlist_as_owner(&mut scenario, &owner_cap, cap_id_of(AGENT), vector[RECIPIENT]);
+
+    scenario.next_tx(AGENT);
+    let mut vault = scenario.take_shared<Vault<SUI>>();
+    let spend_cap = scenario.take_from_sender<SpendCap>();
+    let coin = vault.spend(&spend_cap, 1, &test_clock, scenario.ctx());
+
+    transfer::public_transfer(coin, AGENT);
+    cleanup(scenario, vault, spend_cap, owner_cap, test_clock);
+}
+
+// Allowlist: an empty list is rejected; "pay nobody" is what revoke is for.
+#[test, expected_failure(abort_code = vault::EEmptyAllowlist)]
+fun empty_allowlist_is_rejected() {
+    let mut scenario = test_scenario::begin(OWNER);
+    let mut test_clock = clock::create_for_testing(scenario.ctx());
+    test_clock.set_for_testing(START_MS);
+    let owner_cap = setup(&mut scenario, &test_clock);
+    set_allowlist_as_owner(&mut scenario, &owner_cap, cap_id_of(AGENT), vector[]);
+
+    scenario.next_tx(AGENT);
+    let vault = scenario.take_shared<Vault<SUI>>();
+    let spend_cap = scenario.take_from_sender<SpendCap>();
+    cleanup(scenario, vault, spend_cap, owner_cap, test_clock);
+}
+
+// Allowlist: clearing it makes the cap unrestricted again, so `spend` works.
+#[test]
+fun clear_allowlist_lifts_restriction() {
+    let mut scenario = test_scenario::begin(OWNER);
+    let mut test_clock = clock::create_for_testing(scenario.ctx());
+    test_clock.set_for_testing(START_MS);
+    let owner_cap = setup(&mut scenario, &test_clock);
+    let cap_id = cap_id_of(AGENT);
+    set_allowlist_as_owner(&mut scenario, &owner_cap, cap_id, vector[RECIPIENT]);
+
+    scenario.next_tx(OWNER);
+    let mut vault = scenario.take_shared<Vault<SUI>>();
+    vault.clear_allowlist(&owner_cap, cap_id);
+    test_scenario::return_shared(vault);
+
+    scenario.next_tx(AGENT);
+    let mut vault = scenario.take_shared<Vault<SUI>>();
+    let spend_cap = scenario.take_from_sender<SpendCap>();
+    assert!(vault.is_recipient_allowed(cap_id, OTHER));
+    let coin = vault.spend(&spend_cap, 1, &test_clock, scenario.ctx());
+    assert!(coin.value() == 1);
+
+    transfer::public_transfer(coin, AGENT);
+    cleanup(scenario, vault, spend_cap, owner_cap, test_clock);
+}
+
+// Security: vault B's OwnerCap must not set vault A's allowlists.
+#[test, expected_failure(abort_code = vault::ENotOwner)]
+fun other_owner_cap_cannot_set_allowlist() {
+    let mut scenario = test_scenario::begin(OWNER);
+    let mut test_clock = clock::create_for_testing(scenario.ctx());
+    test_clock.set_for_testing(START_MS);
+    let owner_cap = setup(&mut scenario, &test_clock);
+
+    scenario.next_tx(OWNER);
+    let cap_b = vault::create<SUI>(scenario.ctx());
+
+    scenario.next_tx(OWNER);
+    let mut vault_a = scenario.take_shared_by_id<Vault<SUI>>(owner_cap.vault_id());
+    vault_a.set_allowlist(&cap_b, cap_id_of(AGENT), vector[OTHER]);
+
+    test_scenario::return_shared(vault_a);
+    transfer::public_transfer(cap_b, OWNER);
+    transfer::public_transfer(owner_cap, OWNER);
+    test_clock.destroy_for_testing();
+    scenario.end();
 }

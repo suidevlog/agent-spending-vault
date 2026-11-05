@@ -4,6 +4,7 @@ use sui::balance::{Self, Balance};
 use sui::clock::Clock;
 use sui::coin::{Self, Coin};
 use sui::dynamic_field as df;
+use sui::vec_set::{Self, VecSet};
 
 const ENotOwner: u64 = 0;
 const ENotEnoughBalance: u64 = 1;
@@ -13,6 +14,9 @@ const EWrongVault: u64 = 4;
 const ECapExpired: u64 = 5;
 const ELimitExceeded: u64 = 6;
 const ECapRevoked: u64 = 7;
+const ERecipientNotAllowed: u64 = 8;
+const ERestrictedCap: u64 = 9;
+const EEmptyAllowlist: u64 = 10;
 
 public struct Vault<phantom T> has key {
     id: UID,
@@ -36,6 +40,7 @@ public struct CapRules has drop, store {
     spent_in_period: u64,
     period_start_ms: u64,
     expires_at_ms: u64,
+    allowlist: Option<VecSet<address>>,
 }
 
 // Dynamic-field key: the SpendCap's ID wrapped in its own type.
@@ -101,6 +106,7 @@ public fun issue_spend_cap<T>(
             spent_in_period: 0,
             period_start_ms: now,
             expires_at_ms,
+            allowlist: option::none(),
         },
     );
 
@@ -117,6 +123,11 @@ public fun revoke_spend_cap<T>(vault: &mut Vault<T>, owner_cap: &OwnerCap, cap_i
 
 public fun is_active<T>(vault: &Vault<T>, cap_id: ID): bool {
     df::exists(&vault.id, CapKey(cap_id))
+}
+
+public fun is_recipient_allowed<T>(vault: &Vault<T>, cap_id: ID, recipient: address): bool {
+    let allowlist = &rules(vault, cap_id).allowlist;
+    allowlist.is_none() || allowlist.borrow().contains(&recipient)
 }
 
 fun rules<T>(vault: &Vault<T>, cap_id: ID): &CapRules {
@@ -143,10 +154,11 @@ public fun expires_at_ms<T>(vault: &Vault<T>, cap_id: ID): u64 {
     rules(vault, cap_id).expires_at_ms
 }
 
-public fun spend<T>(
+fun take_for_cap<T>(
     vault: &mut Vault<T>,
     spend_cap: &SpendCap,
     amount: u64,
+    recipient: Option<address>,
     clock: &Clock,
     ctx: &mut TxContext,
 ): Coin<T> {
@@ -162,6 +174,13 @@ public fun spend<T>(
 
     // at exactly expires_at_ms, the cap is dead.
     assert!(now < rules.expires_at_ms, ECapExpired);
+
+    // Recipient rule. A restricted cap may only pay through spend_to,
+    // because a returned Coin could be sent anywhere.
+    if (rules.allowlist.is_some()){
+        assert!(recipient.is_some(), ERestrictedCap);
+        assert!(rules.allowlist.borrow().contains(recipient.borrow()), ERecipientNotAllowed);
+    };
 
     // If a full period has passed, start a new one. This must happen
     // BEFORE the limit check, or yesterday's spending blocks today's.
@@ -181,4 +200,50 @@ public fun spend<T>(
     // and we may borrow the whole vault again.
     assert!(vault.balance_value() >= amount, ENotEnoughBalance);
     coin::take(&mut vault.balance, amount, ctx)
+}
+
+// Restrict a cap to these recipients. Replaces any previous list.
+public fun set_allowlist<T>(
+    vault: &mut Vault<T>,
+    owner_cap: &OwnerCap,
+    cap_id: ID,
+    recipients: vector<address>,
+) {
+    assert!(owner_cap.vault_id == object::id(vault), ENotOwner);
+    assert!(df::exists(&vault.id, CapKey(cap_id)), ECapRevoked);
+    assert!(!recipients.is_empty(), EEmptyAllowlist);
+    let rules: &mut CapRules = df::borrow_mut(&mut vault.id, CapKey(cap_id));
+    rules.allowlist = option::some(vec_set::from_keys(recipients));
+}
+
+// Remove the restriction: the cap may pay anyone again.
+public fun clear_allowlist<T>(vault: &mut Vault<T>, owner_cap: &OwnerCap, cap_id: ID) {
+    assert!(owner_cap.vault_id == object::id(vault), ENotOwner);
+    assert!(df::exists(&vault.id, CapKey(cap_id)), ECapRevoked);
+    let rules: &mut CapRules = df::borrow_mut(&mut vault.id, CapKey(cap_id));
+    rules.allowlist = option::none();
+}
+
+// Returns the coin to the caller's PTB. Only for unrestricted caps.
+public fun spend<T>(
+    vault:&mut Vault<T>,
+    spend_cap: &SpendCap,
+    amount: u64,
+    clock: &Clock,
+    ctx: &mut TxContext,
+): Coin<T> {
+    take_for_cap(vault, spend_cap, amount, option::none(), clock, ctx)
+}
+
+// Pays 'recipient' directly. Works for restricted and unrestricted caps.
+public fun spend_to<T>(
+    vault: &mut Vault<T>,
+    spend_cap: &SpendCap,
+    amount: u64,
+    recipient: address,
+    clock: &Clock,
+    ctx: &mut TxContext,
+) {
+    let coin = take_for_cap(vault, spend_cap, amount, option::some(recipient), clock, ctx);
+    transfer::public_transfer(coin, recipient);
 }
