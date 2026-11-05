@@ -1,3 +1,4 @@
-.env
-.env.testnet
+# Secrets: ignore every env file, keep only the template.
+.env*
+!.env.example
 
