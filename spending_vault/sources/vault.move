@@ -4,6 +4,7 @@ use sui::balance::{Self, Balance};
 use sui::clock::Clock;
 use sui::coin::{Self, Coin};
 use sui::dynamic_field as df;
+use sui::event;
 use sui::vec_set::{Self, VecSet};
 
 const ENotOwner: u64 = 0;
@@ -46,12 +47,69 @@ public struct CapRules has drop, store {
 // Dynamic-field key: the SpendCap's ID wrapped in its own type.
 public struct CapKey(ID) has copy, drop, store;
 
+// ===== Events =====
+// Every state change emits one. Events with an amount carry the coin
+// type, because an amount without its unit means nothing.
+
+public struct VaultCreated<phantom T> has copy, drop {
+    vault_id: ID,
+    owner_cap_id: ID,
+}
+
+public struct Deposited<phantom T> has copy, drop {
+    vault_id: ID,
+    amount: u64,
+}
+
+public struct Withdrawn<phantom T> has copy, drop {
+    vault_id: ID,
+    amount: u64,
+}
+
+public struct SpendCapIssued<phantom T> has copy, drop {
+    vault_id: ID,
+    cap_id: ID,
+    agent: address,
+    limit_per_period: u64,
+    period_ms: u64,
+    expires_at_ms: u64,
+}
+
+public struct SpendCapRevoked has copy, drop {
+    vault_id: ID,
+    cap_id: ID,
+}
+
+public struct AllowlistSet has copy, drop {
+    vault_id: ID,
+    cap_id: ID,
+    recipients: vector<address>,
+}
+
+public struct AllowlistCleared has copy, drop {
+    vault_id: ID,
+    cap_id: ID,
+}
+
+public struct Spent<phantom T> has copy, drop {
+    vault_id: ID,
+    cap_id: ID,
+    amount: u64,
+    recipient: Option<address>,
+    spent_in_period: u64,
+}
+
 public fun create<T>(ctx: &mut TxContext): OwnerCap {
     let vault = Vault { id: object::new(ctx), balance: balance::zero<T>() };
     let cap = OwnerCap {
         id: object::new(ctx),
         vault_id: object::id(&vault),
     };
+
+    event::emit(VaultCreated<T> {
+        vault_id: object::id(&vault),
+        owner_cap_id: object::id(&cap),
+    });
     transfer::share_object(vault);
     cap
 }
@@ -61,7 +119,9 @@ public fun vault_id(cap: &OwnerCap): ID { cap.vault_id }
 public fun balance_value<T>(vault: &Vault<T>): u64 { vault.balance.value() }
 
 public fun deposit<T>(vault: &mut Vault<T>, payment: Coin<T>) {
+    let amount = payment.value();
     vault.balance.join(payment.into_balance());
+    event::emit(Deposited<T> { vault_id: object::id(vault), amount });
 }
 
 public fun withdraw<T>(
@@ -75,6 +135,7 @@ public fun withdraw<T>(
     // Balance has to be equal or more than withdrawal amount
     assert!(balance_value(vault) >= amount, ENotEnoughBalance);
 
+    event::emit(Withdrawn<T> { vault_id: object::id(vault), amount });
     coin::take(&mut vault.balance, amount, ctx)
 }
 
@@ -110,6 +171,15 @@ public fun issue_spend_cap<T>(
         },
     );
 
+    event::emit(SpendCapIssued<T> {
+        vault_id: object::id(vault),
+        cap_id: object::id(&spend_cap),
+        agent,
+        limit_per_period,
+        period_ms,
+        expires_at_ms,
+    });
+
     transfer::transfer(spend_cap, agent);
 }
 
@@ -119,6 +189,7 @@ public fun revoke_spend_cap<T>(vault: &mut Vault<T>, owner_cap: &OwnerCap, cap_i
     assert!(owner_cap.vault_id == object::id(vault), ENotOwner);
     assert!(df::exists(&vault.id, CapKey(cap_id)), ECapRevoked);
     let _rules: CapRules = df::remove(&mut vault.id, CapKey(cap_id));
+    event::emit(SpendCapRevoked { vault_id: object::id(vault), cap_id });
 }
 
 public fun is_active<T>(vault: &Vault<T>, cap_id: ID): bool {
@@ -177,7 +248,7 @@ fun take_for_cap<T>(
 
     // Recipient rule. A restricted cap may only pay through spend_to,
     // because a returned Coin could be sent anywhere.
-    if (rules.allowlist.is_some()){
+    if (rules.allowlist.is_some()) {
         assert!(recipient.is_some(), ERestrictedCap);
         assert!(rules.allowlist.borrow().contains(recipient.borrow()), ERecipientNotAllowed);
     };
@@ -195,10 +266,18 @@ fun take_for_cap<T>(
     // Record the spend. If the balance check below aborts, the whole
     // transaction reverts, so this write never persists on failure.
     rules.spent_in_period = rules.spent_in_period + amount;
+    let spent_in_period = rules.spent_in_period;
 
     // 'rules' is no longer used, so the mutable borrow of vault.id has ended
     // and we may borrow the whole vault again.
     assert!(vault.balance_value() >= amount, ENotEnoughBalance);
+    event::emit(Spent<T> {
+        vault_id: object::id(vault),
+        cap_id: object::id(spend_cap),
+        amount,
+        recipient,
+        spent_in_period,
+    });
     coin::take(&mut vault.balance, amount, ctx)
 }
 
@@ -214,6 +293,7 @@ public fun set_allowlist<T>(
     assert!(!recipients.is_empty(), EEmptyAllowlist);
     let rules: &mut CapRules = df::borrow_mut(&mut vault.id, CapKey(cap_id));
     rules.allowlist = option::some(vec_set::from_keys(recipients));
+    event::emit(AllowlistSet { vault_id: object::id(vault), cap_id, recipients });
 }
 
 // Remove the restriction: the cap may pay anyone again.
@@ -222,11 +302,12 @@ public fun clear_allowlist<T>(vault: &mut Vault<T>, owner_cap: &OwnerCap, cap_id
     assert!(df::exists(&vault.id, CapKey(cap_id)), ECapRevoked);
     let rules: &mut CapRules = df::borrow_mut(&mut vault.id, CapKey(cap_id));
     rules.allowlist = option::none();
+    event::emit(AllowlistCleared { vault_id: object::id(vault), cap_id });
 }
 
 // Returns the coin to the caller's PTB. Only for unrestricted caps.
 public fun spend<T>(
-    vault:&mut Vault<T>,
+    vault: &mut Vault<T>,
     spend_cap: &SpendCap,
     amount: u64,
     clock: &Clock,
@@ -246,4 +327,22 @@ public fun spend_to<T>(
 ) {
     let coin = take_for_cap(vault, spend_cap, amount, option::some(recipient), clock, ctx);
     transfer::public_transfer(coin, recipient);
+}
+
+// ===== Test-only helpers =====
+// Event fields are private to this module. Tests read and build events
+// through these; #[test_only] keeps them out of the published package.
+
+#[test_only]
+public fun issued_cap_id<T>(e: &SpendCapIssued<T>): ID { e.cap_id }
+
+#[test_only]
+public fun new_spent_for_testing<T>(
+    vault_id: ID,
+    cap_id: ID,
+    amount: u64,
+    recipient: Option<address>,
+    spent_in_period: u64,
+): Spent<T> {
+    Spent { vault_id, cap_id, amount, recipient, spent_in_period }
 }

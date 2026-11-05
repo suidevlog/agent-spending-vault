@@ -1,9 +1,23 @@
 #[test_only]
 module spending_vault::vault_tests;
 
-use spending_vault::vault::{Self, Vault, OwnerCap, SpendCap};
+use spending_vault::vault::{
+    Self,
+    Vault,
+    OwnerCap,
+    SpendCap,
+    VaultCreated,
+    Deposited,
+    Withdrawn,
+    SpendCapIssued,
+    SpendCapRevoked,
+    AllowlistSet,
+    AllowlistCleared,
+    Spent,
+};
 use sui::clock::{Self, Clock};
 use sui::coin::{Self, Coin};
+use sui::event;
 use sui::sui::SUI;
 use sui::test_scenario::{Self, Scenario};
 
@@ -639,7 +653,7 @@ fun revoking_one_cap_leaves_others_active() {
 
     let coin = vault.spend(&cap_2, ONE_SUI, &test_clock, scenario.ctx());
     assert!(coin.value() == ONE_SUI);
-    
+
     transfer::public_transfer(coin, AGENT_2);
     cleanup(scenario, vault, cap_2, owner_cap, test_clock);
 }
@@ -770,6 +784,135 @@ fun other_owner_cap_cannot_set_allowlist() {
 
     test_scenario::return_shared(vault_a);
     transfer::public_transfer(cap_b, OWNER);
+    transfer::public_transfer(owner_cap, OWNER);
+    test_clock.destroy_for_testing();
+    scenario.end();
+}
+
+// Events: the owner learns a new cap's ID from SpendCapIssued, the way a
+// real revoke script would, and it matches the object the agent received.
+#[test]
+fun owner_learns_cap_id_from_issue_event() {
+    let mut scenario = test_scenario::begin(OWNER);
+    let mut test_clock = clock::create_for_testing(scenario.ctx());
+    test_clock.set_for_testing(START_MS);
+    let owner_cap = vault::create<SUI>(scenario.ctx());
+
+    scenario.next_tx(OWNER);
+    let mut vault = scenario.take_shared<Vault<SUI>>();
+    vault.issue_spend_cap(
+        &owner_cap,
+        AGENT,
+        ONE_SUI,
+        DAY_MS,
+        START_MS + 7 * DAY_MS,
+        &test_clock,
+        scenario.ctx(),
+    );
+    let issued = event::events_by_type<SpendCapIssued<SUI>>();
+    assert!(issued.length() == 1);
+    let cap_id = vault::issued_cap_id(&issued[0]);
+    test_scenario::return_shared(vault);
+
+    scenario.next_tx(AGENT);
+    let spend_cap = scenario.take_from_sender<SpendCap>();
+    assert!(object::id(&spend_cap) == cap_id);
+
+    scenario.return_to_sender(spend_cap);
+    transfer::public_transfer(owner_cap, OWNER);
+    test_clock.destroy_for_testing();
+    scenario.end();
+}
+
+// Events: Spent records exact amount, recipient and running total.
+// spend_to names the recipient; spend reports none (coin went to the PTB).
+#[test]
+fun spend_events_record_amount_and_recipient() {
+    let mut scenario = test_scenario::begin(OWNER);
+    let mut test_clock = clock::create_for_testing(scenario.ctx());
+    test_clock.set_for_testing(START_MS);
+    let owner_cap = setup(&mut scenario, &test_clock);
+    let vault_id = owner_cap.vault_id();
+
+    let mut vault = scenario.take_shared<Vault<SUI>>();
+    let spend_cap = scenario.take_from_sender<SpendCap>();
+    let cap_id = object::id(&spend_cap);
+
+    // spend_to on an UNRESTRICTED cap: allowed, and the event names the recipient.
+    vault.spend_to(&spend_cap, ONE_SUI / 2, RECIPIENT, &test_clock, scenario.ctx());
+    assert!(
+        event::events_by_type<Spent<SUI>>() == vector[
+            vault::new_spent_for_testing<SUI>(
+                vault_id,
+                cap_id,
+                ONE_SUI / 2,
+                option::some(RECIPIENT),
+                ONE_SUI / 2,
+            ),
+        ],
+    );
+    test_scenario::return_shared(vault);
+    scenario.return_to_sender(spend_cap);
+
+    scenario.next_tx(AGENT);
+    let mut vault = scenario.take_shared<Vault<SUI>>();
+    let spend_cap = scenario.take_from_sender<SpendCap>();
+    let coin = vault.spend(&spend_cap, ONE_SUI / 4, &test_clock, scenario.ctx());
+    assert!(
+        event::events_by_type<Spent<SUI>>() == vector[
+            vault::new_spent_for_testing<SUI>(
+                vault_id,
+                cap_id,
+                ONE_SUI / 4,
+                option::none(),
+                3 * ONE_SUI / 4,
+            ),
+        ],
+    );
+
+    transfer::public_transfer(coin, AGENT);
+    cleanup(scenario, vault, spend_cap, owner_cap, test_clock);
+}
+
+// Events: each admin action emits exactly one event of its own type,
+// and nothing emits twice.
+#[test]
+fun admin_actions_emit_one_event_each() {
+    let mut scenario = test_scenario::begin(OWNER);
+    let mut test_clock = clock::create_for_testing(scenario.ctx());
+    test_clock.set_for_testing(START_MS);
+    let owner_cap = vault::create<SUI>(scenario.ctx());
+    assert!(event::events_by_type<VaultCreated<SUI>>().length() == 1);
+
+    scenario.next_tx(OWNER);
+    let mut vault = scenario.take_shared<Vault<SUI>>();
+    vault.deposit(coin::mint_for_testing<SUI>(ONE_SUI, scenario.ctx()));
+    let coin = vault.withdraw(&owner_cap, ONE_SUI / 2, scenario.ctx());
+    transfer::public_transfer(coin, OWNER);
+    vault.issue_spend_cap(
+        &owner_cap,
+        AGENT,
+        ONE_SUI,
+        DAY_MS,
+        START_MS + 7 * DAY_MS,
+        &test_clock,
+        scenario.ctx(),
+    );
+    let issued = event::events_by_type<SpendCapIssued<SUI>>();
+    let cap_id = vault::issued_cap_id(&issued[0]);
+    vault.set_allowlist(&owner_cap, cap_id, vector[RECIPIENT]);
+    vault.clear_allowlist(&owner_cap, cap_id);
+    vault.revoke_spend_cap(&owner_cap, cap_id);
+
+    assert!(event::events_by_type<Deposited<SUI>>().length() == 1);
+    assert!(event::events_by_type<Withdrawn<SUI>>().length() == 1);
+    assert!(event::events_by_type<SpendCapIssued<SUI>>().length() == 1);
+    assert!(event::events_by_type<AllowlistSet>().length() == 1);
+    assert!(event::events_by_type<AllowlistCleared>().length() == 1);
+    assert!(event::events_by_type<SpendCapRevoked>().length() == 1);
+    assert!(event::num_events() == 6);
+
+    test_scenario::return_shared(vault);
     transfer::public_transfer(owner_cap, OWNER);
     test_clock.destroy_for_testing();
     scenario.end();
