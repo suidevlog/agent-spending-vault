@@ -70,6 +70,15 @@ Events with an amount carry the coin type.
 | 9 | `ERestrictedCap` | `spend` called on a cap with an allowlist |
 | 10 | `EEmptyAllowlist` | `set_allowlist` called with an empty list |
 
+## Deployments
+
+| Network | Package ID | Built from |
+|---|---|---|
+| testnet | `0x408397699192297855badb18c10e20b5d3395052decd8a6742587ab4d5eee3e8` | tag `v2` |
+
+UpgradeCap (owned by the deployer):
+`0x95f816004e3153a1dd583cc3f42b31b0b7fc383cf2a87afee8a481e4eb88d9a5`
+
 ## Build & test
 
 Requires: Sui CLI 1.82+
