@@ -6,7 +6,10 @@
   "scripts": {
     "test": "echo \"Error: no test specified\" && exit 1",
     "check": "node src/check.ts",
-    "typecheck": "tsc --noEmit"
+    "typecheck": "tsc --noEmit",
+    "create-vault": "node --env-file=.env src/create-vault.ts",
+    "inspect-tx": "node src/inspect-tx.ts",
+    "list-events": "node src/list-events.ts"
   },
   "keywords": [],
   "author": "",

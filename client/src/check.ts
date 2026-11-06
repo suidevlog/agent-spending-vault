@@ -1,10 +1,7 @@
 import { SuiGrpcClient } from "@mysten/sui/grpc";
 import { DEPLOYER, UPGRADE_CAP_ID } from "./config.ts";
+import { client } from "./client.ts"
 
-const client = new SuiGrpcClient({
-    network: 'testnet',
-    baseUrl: 'https://fullnode.testnet.sui.io:443',
-});
 
 // Balance: coin objects and address balance are reported saperately.
 const { balance } = await client.getBalance({ owner: DEPLOYER });
